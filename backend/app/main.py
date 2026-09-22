@@ -1,22 +1,40 @@
-import asyncio, time, random, json, threading
+import asyncio
+import json
+import random
+import threading
+import time
 from collections import defaultdict, deque
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from . import database as db
 
 app = FastAPI(title="DAG Workflow Engine")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 ACTIVE_CLIENTS = []
 WORKFLOW_ID = 0
+EVENT_LOOP = None
+
 
 class WorkflowCreate(BaseModel):
     name: str = "data-pipeline"
+
 
 class RunRequest(BaseModel):
     workflowId: int
     workers: int = 3
     strategy: str = "fifo"
+
+
+@app.on_event("startup")
+def startup():
+    global EVENT_LOOP
+    db.init_db()
+    EVENT_LOOP = asyncio.get_event_loop()
 
 
 def generate_dag_workflow(name: str):
@@ -48,8 +66,8 @@ def generate_dag_workflow(name: str):
 
     edges = []
     for n in nodes:
-        for d in n["deps"]:
-            edges.append([d, n["id"]])
+        for dep in n["deps"]:
+            edges.append([dep, n["id"]])
 
     return {"nodes": [{
         "id": n["id"], "name": n["name"], "deps": n["deps"],
@@ -70,15 +88,21 @@ def create_workflow(req: WorkflowCreate):
 @app.post("/api/run")
 def run_workflow(req: RunRequest):
     dag = generate_dag_workflow("workflow")
-    t = threading.Thread(target=execute_workflow, args=(dag, req.workers, req.strategy), daemon=True)
+    run_id = db.create_workflow_run(req.workflowId, "workflow", req.workers, req.strategy)
+    t = threading.Thread(
+        target=execute_workflow,
+        args=(run_id, dag, req.workers, req.strategy),
+        daemon=True,
+    )
     t.start()
     return {
+        "runId": run_id,
         "workflow": {"id": req.workflowId, "name": "workflow", "nodes": dag["nodes"], "edges": dag["edges"]},
         "logs": [], "circuitBreakers": [], "completed": False
     }
 
 
-def execute_workflow(dag, workers, strategy):
+def execute_workflow(run_id: int, dag, workers, strategy):
     nodes = dag["nodes"]
     durations = dag["durations"]
     edges = dag["edges"]
@@ -95,18 +119,25 @@ def execute_workflow(dag, workers, strategy):
     cb_state = defaultdict(lambda: {"failureCount": 0, "state": "CLOSED", "cooldownUntil": 0})
     failure_threshold = 3
     running_tasks = {}
+    first_start = {}
+    attempts = {}
     completed = set()
+    failed = set()
 
     def send_update(completed_flag=False):
         payload = {
-            "workflow": {"id": 1, "name": "workflow", "nodes": nodes, "edges": edges},
+            "runId": run_id,
+            "workflow": {"id": run_id, "name": "workflow", "nodes": nodes, "edges": edges},
             "logs": logs[-30:],
             "circuitBreakers": [{"taskId": k, **v} for k, v in cb_state.items()],
             "completed": completed_flag
         }
-        for ws in ACTIVE_CLIENTS:
-            try: asyncio.run_coroutine_threadsafe(ws.send_text(json.dumps(payload)), asyncio.get_event_loop())
-            except: pass
+        for ws in list(ACTIVE_CLIENTS):
+            try:
+                asyncio.run_coroutine_threadsafe(ws.send_text(json.dumps(payload)), EVENT_LOOP)
+            except Exception:
+                if ws in ACTIVE_CLIENTS:
+                    ACTIVE_CLIENTS.remove(ws)
         time.sleep(0.3)
 
     while ready or running_tasks:
@@ -117,61 +148,108 @@ def execute_workflow(dag, workers, strategy):
             cb = cb_state[tid]
             if cb["state"] == "OPEN" and time.time() < cb["cooldownUntil"]:
                 ready.appendleft(tid)
-                continue
+                break
             if cb["state"] == "OPEN":
                 cb["state"] = "HALF_OPEN"
 
+            now = time.time()
             node["status"] = "RUNNING"
-            node["startTime"] = time.time()
+            if node["startTime"] is None:
+                node["startTime"] = now
+            if tid not in first_start:
+                first_start[tid] = now
+                attempts[tid] = 1
 
             # Simulate task execution (random success/failure)
             will_fail = random.random() < 0.12  # 12% failure rate
             runtime = durations.get(tid, 1.5) * random.uniform(0.7, 1.3)
             running_tasks[tid] = {
-                "end_time": time.time() + runtime,
+                "end_time": now + runtime,
                 "will_fail": will_fail,
-                "retries": node["retries"]
             }
-            logs.append({"taskId": tid, "status": "RUNNING", "timestamp": time.time(), "message": f"开始执行 {node['name']}"})
+            logs.append({"taskId": tid, "status": "RUNNING", "timestamp": now, "message": f"开始执行 {node['name']}"})
 
         # Check completed tasks
         now = time.time()
         finished = []
-        for tid, info in running_tasks.items():
-            if now >= info["end_time"]:
-                node = node_map[tid]
-                if info["will_fail"] and node["retries"] < 3:
-                    node["retries"] += 1
-                    node["status"] = "PENDING"
-                    ready.appendleft(tid)
-                    cb = cb_state[tid]
-                    cb["failureCount"] += 1
-                    logs.append({"taskId": tid, "status": "FAILED", "timestamp": now, "message": f"重试 {node['retries']}/3"})
-                    if cb["failureCount"] >= failure_threshold:
-                        cb["state"] = "OPEN"
-                        cb["cooldownUntil"] = now + 5
-                        logs.append({"taskId": tid, "status": "CIRCUIT_OPEN", "timestamp": now, "message": f"熔断! {failure_threshold}次连续失败"})
-                else:
-                    node["status"] = "SUCCESS"
-                    node["endTime"] = now
+        for tid, info in list(running_tasks.items()):
+            if now < info["end_time"]:
+                continue
+
+            node = node_map[tid]
+            if info["will_fail"] and node["retries"] < 3:
+                node["retries"] += 1
+                attempts[tid] += 1
+                node["status"] = "PENDING"
+                node["endTime"] = None
+                ready.appendleft(tid)
+                cb = cb_state[tid]
+                cb["failureCount"] += 1
+                cb["cooldownUntil"] = now + 5
+                logs.append({"taskId": tid, "status": "FAILED", "timestamp": now, "message": f"重试 {node['retries']}/3"})
+                if cb["failureCount"] >= failure_threshold:
+                    cb["state"] = "OPEN"
+                    logs.append({"taskId": tid, "status": "CIRCUIT_OPEN", "timestamp": now, "message": f"熔断! {failure_threshold}次连续失败"})
+            else:
+                status = "FAILED" if info["will_fail"] else "SUCCESS"
+                node["status"] = status
+                node["endTime"] = now
+                if status == "SUCCESS":
                     completed.add(tid)
                     cb_state[tid]["failureCount"] = 0
                     cb_state[tid]["state"] = "CLOSED"
-                    logs.append({"taskId": tid, "status": "SUCCESS", "timestamp": now, "message": f"完成 {node['name']}"})
                     for next_tid in adj[tid]:
                         in_degree[next_tid] -= 1
                         if in_degree[next_tid] == 0:
                             ready.append(next_tid)
-                finished.append(tid)
+                else:
+                    failed.add(tid)
+                    cb_state[tid]["state"] = "OPEN"
+                    cb_state[tid]["cooldownUntil"] = now + 5
+                    logs.append({"taskId": tid, "status": "FAILED", "timestamp": now, "message": f"失败 {node['name']}"})
+
+                db.insert_task_run(
+                    run_id=run_id,
+                    task_id=tid,
+                    task_name=node["name"],
+                    status=status,
+                    attempts=attempts.get(tid, 1),
+                    started_at=int(first_start[tid] * 1000),
+                    finished_at=int(now * 1000),
+                )
+            finished.append(tid)
 
         for tid in finished:
-            del running_tasks[tid]
+            running_tasks.pop(tid, None)
 
         send_update()
-        if len(completed) == len(nodes):
+        if len(completed) + len(failed) == len(nodes):
             break
 
+    final_status = "SUCCESS" if not failed and len(completed) == len(nodes) else "FAILED"
+    db.complete_workflow_run(run_id, final_status)
     send_update(True)
+
+
+@app.get("/api/execution-report")
+def execution_report(
+    startTime: Optional[str] = Query(None),
+    endTime: Optional[str] = Query(None),
+    taskId: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(20, ge=1, le=100),
+):
+    if status and status not in {"SUCCESS", "FAILED"}:
+        raise HTTPException(status_code=400, detail="status must be SUCCESS or FAILED")
+    try:
+        start_ms = db.parse_time(startTime)
+        end_ms = db.parse_time(endTime, end_of_day=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid time range") from exc
+    if start_ms is not None and end_ms is not None and start_ms > end_ms:
+        raise HTTPException(status_code=400, detail="startTime must not be later than endTime")
+    return db.get_execution_report(start_ms, end_ms, taskId, status, page, pageSize)
 
 
 @app.websocket("/ws")
@@ -179,6 +257,11 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     ACTIVE_CLIENTS.append(ws)
     try:
-        while True: await ws.receive_text()
-    except:
-        if ws in ACTIVE_CLIENTS: ACTIVE_CLIENTS.remove(ws)
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        if ws in ACTIVE_CLIENTS:
+            ACTIVE_CLIENTS.remove(ws)
+    except Exception:
+        if ws in ACTIVE_CLIENTS:
+            ACTIVE_CLIENTS.remove(ws)

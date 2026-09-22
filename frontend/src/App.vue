@@ -15,30 +15,44 @@
         <span class="ws-dot" :class="{on:store.wsConnected}"></span>
       </div>
     </header>
-    <div class="main-grid">
-      <div class="dag-area">
-        <DAGCanvas />
-      </div>
-      <div class="side-area">
-        <LogPanel />
-        <CircuitBreakerPanel />
-      </div>
-    </div>
+    <nav class="tab-bar">
+      <button class="tab" :class="{active: isLive}" @click="go('/')">实时监控</button>
+      <button class="tab" :class="{active: isReport}" @click="go('/report')">执行报表</button>
+      <button class="tab" :class="{active: isDetail}" @click="go('/detail')">明细列表</button>
+    </nav>
+
+    <LiveView v-if="isLive" class="tab-body" />
+    <ReportPage v-else-if="isReport" class="tab-body" />
+    <DetailPage v-else-if="isDetail" class="tab-body" />
+    <RunDetailPage v-else-if="isRun" class="tab-body" />
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
-import DAGCanvas from './components/DAGCanvas.vue'
-import LogPanel from './components/LogPanel.vue'
-import CircuitBreakerPanel from './components/CircuitBreakerPanel.vue'
+import { computed, ref, onMounted, onUnmounted } from 'vue'
+import ReportPage from './pages/ReportPage.vue'
+import DetailPage from './pages/DetailPage.vue'
+import RunDetailPage from './pages/RunDetailPage.vue'
+import LiveView from './pages/LiveView.vue'
 import { useDAGStore } from './store/dag'
+import { route, push } from './router'
+
 const store = useDAGStore()
 const wfName = ref('data-pipeline')
 function create() { store.createWorkflow(wfName.value) }
 function run() { store.run() }
 onMounted(() => store.connectWS())
 onUnmounted(() => store.disconnectWS())
+
+const path = computed(() => route.value.path)
+const isLive = computed(() => path.value === '/')
+const isReport = computed(() => path.value === '/report')
+const isDetail = computed(() => path.value === '/detail')
+const isRun = computed(() => path.value.startsWith('/run/'))
+function go(p: string) {
+  // Keep the current time-range filter when switching between report/detail.
+  push(p, route.value.query)
+}
 </script>
 
 <style>
@@ -49,6 +63,14 @@ body{font-family:system-ui,sans-serif;background:#0c0c1d;color:#e0e0e0}
 .top-bar h1{font-size:1rem;color:#bb86fc}
 .tools{display:flex;gap:6px;align-items:center}
 .ws-dot{width:8px;height:8px;border-radius:50%;background:#ef4444}.ws-dot.on{background:#22c55e}
+.tab-bar{display:flex;gap:4px;padding:0 16px;background:#15152a;border-bottom:1px solid #2a2a4a}
+.tab{background:none;border:none;color:#8a8ab0;padding:10px 18px;cursor:pointer;font-size:13px;border-bottom:2px solid transparent}
+.tab:hover{color:#e0e0e0}
+.tab.active{color:#bb86fc;border-bottom-color:#bb86fc}
+.tab-body{flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column}
+</style>
+
+<style scoped>
 .main-grid{display:grid;grid-template-columns:1fr 320px;flex:1;overflow:hidden}
 .dag-area{background:#0f0f23;position:relative;overflow:hidden}
 .side-area{display:flex;flex-direction:column;gap:8px;padding:8px;overflow-y:auto;background:#14142b}
